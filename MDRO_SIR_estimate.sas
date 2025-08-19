@@ -1,11 +1,21 @@
 
-
-
-
-
-
-
-
+/*
+ *------------------------------------------------------------------------------
+ * Program Name:  mdro_sir_estimate
+ * Author:        Mikhail Hoskins
+ * Date Created:  07/23/2025
+ * Date Modified: 08/19/2025
+ * Description:   Apply NHSN's SIR model to MDROs in NC. 
+ *				  
+ *
+ * Inputs:       recordssas.sas7bdat 
+ * Output:       .
+ * Notes:        Program pulls all CRE/MDRO cases and links them to a 'pretend' NC where we create demographic breakdowns to mimic NC. 
+ *					
+ *				 Model design: https://www.cdc.gov/nhsn/2022rebaseline/sir-guide.pdf	
+ *
+ *------------------------------------------------------------------------------
+ */
 
 /*Clear results from prior code*/
 dm 'odsresults; clear';
