@@ -10,10 +10,24 @@
  *
  * Inputs:       recordssas.sas7bdat 
  * Output:       .
- * Notes:        Program pulls all CRE/MDRO cases and links them to a 'pretend' NC where we create demographic breakdowns to mimic NC. 
- *					
+ * Notes:        Program pulls all CRE/MDRO cases and links them to a 'pretend' NC where we create demographic breakdowns to mimic NC. Then we use this population estimate to create logistic reg. for all
+ *				 variables that are deemed important in CRE transmission that we can assign to a population value and apply that regression at the row level to create a probability of infection for each "individual"
+ *				 in the state. Then we total those up for our "expected" value to create an estimated SIR. 
  *				 Model design: https://www.cdc.gov/nhsn/2022rebaseline/sir-guide.pdf	
  *
+ *
+ *				 By assigning a value independently to each demographic or risk factor. I suspect our outcomes will bias toward the NULL becuase we know each of these factors compound each other and separating them
+ *				 into independent categories randomizes each risk factor categorization making one person less likely to have multiple risk factors. 
+ *	
+ *				 For example, in NC, black/aa populations may be more likely to be in a high SVI area thus compounding risk. In this model, SVI is independent of race and assigned randomly. Thus, the probability of
+ *				 being black/aa AND in an SVI high geopgraphical area is less likely than in the real world. By biasing toward the NULL, I think it is ok to assume the logistic model underestimates the statistical significance 
+ *				 of each factor (except maybe age). By underestimating the impact the model may not be as powerful and any statistically significant conclusions will be more likely to be true in real world application while  
+ *				 non-statistically significant conclusions could be underestimated. 
+ *	
+ *	
+ *				 TLDR; this is a very conservative model. 
+ *	
+ *	
  *------------------------------------------------------------------------------
  */
 
@@ -28,7 +42,7 @@ libname SASdata 'T:\HAI\Code library\Epi curve example\SASData'; /*SAS datasets 
 data denoms_expanded;
 call streaminit(123); /* Better random generator than ranuni */
 
-do identifier = 1 to (10835491-368);
+do identifier = 1 to (10835491-368); /*state pop - number of infections*/
 
 /* Age group weighted assignment */
 rand_age = rand("uniform");
@@ -64,13 +78,17 @@ rand_sex = rand("uniform");
 if rand_sex < 0.489 then gender= 0; /*female*/
 else gender=1;
 
+/*HCE_yn: binary healthcare experience randomized: 
+Data estimate from here: https://www.cdc.gov/nchs/fastats/hospital.htm and https://ftp.cdc.gov/pub/Health_Statistics/NCHS/NHIS/SHS/2018_SHS_Table_P-10.pdf
+Assuming NC follows the national trend lets err on the conservative side and say 7.9% of the 'pretend' population has a HCE experience*/
+HCE_yn = rand("bernoulli", 0.079); /* ~10% high vulnerability */
 
 output;
 end;
 run;
 
 /*Check to make sure the numbers and the percentages are representative of each population group (should reflect NC)*/
-proc freq data=denoms_expanded; tables age_group rurality svi race gender eth/norow nocol nocum;run;
+proc freq data=denoms_expanded; tables age_group race*svi /*rurality svi  gender eth HCE_yn*/ /norow nocol nocum;run;
 
 
 /*Import case file and define rurality and svi*/
@@ -141,7 +159,8 @@ set SASdata.recordssas;
 	where year in (2024);
 
 run;
-proc print data= case_import (obs=10);run;
+
+proc freq data= case_import;tables HCE / norow nocol nopercent;run;
 
 /*Rename and keep only variables we are analysing in numerc format*/
 proc sql;
@@ -197,6 +216,13 @@ select
 		  
 		 else . end as gender,
 
+/*Healthcare experience*/
+
+	case when HCE in ('No', 'Unknown') then 0 
+		 when HCE in ('') then .
+
+	else 1 end as HCE_yn,
+
 	case when CLASSIFICATION_CLASSIFICATION in ('Confirmed') then 1 else 0 end as case_flag
 
 from case_import 
@@ -205,17 +231,12 @@ alter table cases_analysis
 		drop race_new; /*keep numeric only*/
 quit;
 
-
-proc freq data=cases_analysis; tables eth /norow nocol nocum;run;
-
-
-
 /*Join population file to our case file for a comprehensive file of a 'pretend' NC with real cases*/
 proc sql;
 create table population_file as
 select
 	
-	identifier, age_group, rurality, svi, race, eth, gender,
+	identifier, age_group, rurality, svi, race, eth, gender, HCE_yn,
 
 	case when identifier not in (.) then 0 else 1 end as case_flag
 
@@ -223,7 +244,9 @@ from denoms_expanded
 
 union select
 
-	identifier, age_group, rurality, svi, race, eth, gender, case_flag
+	identifier, age_group, rurality, svi, race, eth, gender, HCE_yn,
+
+	case_flag
 
 from cases_analysis
 
@@ -235,20 +258,19 @@ quit;
 /*Create a logistic reg. model using key variables... in a perfect world we're using statistically significant values only, but for example's sake we'll keep everything*/
 proc logistic data=population_file descending outmodel=model_logit;
 
-	class age_group (param=ref ref='0') race (param=ref ref='0')  rurality (param=ref ref='0')  svi (param=ref ref='0') eth (param=ref ref='0') gender (param=ref ref='0');
-	model case_flag = age_group rurality svi race gender eth / expb;
+	class age_group (param=ref ref='0') race (param=ref ref='0')  rurality (param=ref ref='0') 
+		  svi (param=ref ref='0') eth (param=ref ref='0') gender (param=ref ref='0') HCE_yn (param=ref ref='0');
+	model case_flag = age_group race rurality svi gender eth HCE_yn / expb;
 
 run;
 
 
-/*KEY PIECE: Now we're going to use our model we created and apply it to each row with "score." The logistic formula ?????????? (??p) = ?? + ??1??1 + ??2??2 + ? + ??n??n will be applied to each row.*/
+/*KEY PIECE: Now we're going to use our model we created and apply it to each row with "score." The logistic formula logit (prob) = intercept + B1Var1 + B2Var2 + BnVarn will be applied to each row. Where B is the parameter and Var is the presence or category of the variable*/
 proc logistic inmodel=model_logit;
 
 	score data=population_file out=population_score  ;
 
 run;
-
-
 
 /* Now we have a 10 million + table and each row or pretend individual has a probability of having a CRE. Now keep/create 4 things:
 
@@ -262,10 +284,10 @@ proc sql;
 create table test_sir_mdro as
 select
 
-	 P_1 as prob_total "Total MDROs Predicted" format 10.2,
-	 case_flag as mdro_total "Total MDROs Observed" format 10.0,
+	 P_1 as prob_total "Total CRE Predicted" format 10.2,
+	 case_flag as mdro_total "Total CRE Observed" format 10.0,
 
-		( mdro_total /  prob_total) as MDRO_infecratio "MDRO Infection Ratio" format 10.2,
+		( mdro_total /  prob_total) as MDRO_infecratio "CRE Infection Ratio" format 10.2,
 		(STDERR(calculated MDRO_infecratio)) as std_err "Standard error" 
 
 
@@ -279,14 +301,19 @@ proc sql;
 create table test_sir_mdro_CI as
 select
 	
-	 sum (prob_total) as prob_total_2 "Total MDROs Predicted" format 10.2,
-	 sum (mdro_total) as mdro_total_2 "Total MDROs Observed" format 10.0,
-		(calculated mdro_total_2 / calculated prob_total_2) as MDRO_infecratio_2 "MDRO Infection Ratio" format 10.2,
+	 sum (prob_total) as prob_total_2 "Total CRE Predicted" format 10.2,
+	 sum (mdro_total) as mdro_total_2 "Total CRE Observed" format 10.0,
+		(calculated mdro_total_2 / calculated prob_total_2) as MDRO_infecratio_2 "CRE Infection Ratio" format 10.2,
 
 		/*Since standard error is the same for each valuation, we'll just take the "max" one so we just have a single value. Could do min or select a specific one, just need 1 std error for CI calc.*/
 		max(std_err) as std_err_calc "Standard error",
 		(calculated MDRO_infecratio_2 - (1.96*(calculated std_err_calc))) as lCL "Lower confidence limit" format 10.2,
-		(calculated MDRO_infecratio_2 + (1.96*(calculated std_err_calc))) as uCL "Upper confidence limit" format 10.2
+		(calculated MDRO_infecratio_2 + (1.96*(calculated std_err_calc))) as uCL "Upper confidence limit" format 10.2,
+
+		/*Add interpretation*/
+	case when calculated MDRO_infecratio_2 GE 1 and 1 < calculated lCL then "Worse than expected"
+		 when calculated MDRO_infecratio_2 GE 1 and calculated uCL < 1 then "Better than expected"
+		 	else "Same as expected" end as interp "Interpretion for 2024"
 
 from test_sir_mdro
 ;
